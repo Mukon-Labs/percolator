@@ -455,6 +455,7 @@ fn v16_view_fee_sync_settles_flat_loss_before_fee() {
     header.vault = V16PodU128::new(100);
     header.c_tot = V16PodU128::new(100);
     header.negative_pnl_account_count = V16PodU64::new(1);
+    header.bankruptcy_hlock_active = 1;
     header.current_slot = V16PodU64::new(10);
     header.slot_last = V16PodU64::new(10);
     account_header.capital = V16PodU128::new(100);
@@ -473,6 +474,31 @@ fn v16_view_fee_sync_settles_flat_loss_before_fee() {
     assert_eq!(market_view.header.insurance.get(), 60);
     assert_eq!(market_view.header.vault.get(), 100);
     assert_eq!(market_view.header.negative_pnl_account_count.get(), 0);
+    assert_eq!(market_view.header.bankruptcy_hlock_active, 0);
+}
+
+#[test]
+fn v16_view_fee_sync_keeps_bankruptcy_hlock_for_unresolved_loss() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 40);
+    header.vault = V16PodU128::new(20);
+    header.c_tot = V16PodU128::new(20);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+    header.bankruptcy_hlock_active = 1;
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(10);
+    account_header.capital = V16PodU128::new(20);
+    account_header.pnl = V16PodI128::new(-40);
+
+    let mut market_view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account_view = PortfolioV16ViewMut::new(&mut account_header);
+    market_view
+        .sync_account_fee_to_slot_not_atomic(&mut account_view, 10, 10)
+        .unwrap();
+
+    assert_eq!(account_view.header.pnl.get(), -20);
+    assert_eq!(market_view.header.negative_pnl_account_count.get(), 1);
+    assert_eq!(market_view.header.bankruptcy_hlock_active, 1);
 }
 
 #[test]
@@ -2720,6 +2746,7 @@ fn v16_principal_loss_crystallizes_residual_budget_monotonically() {
     header.vault = V16PodU128::new(100);
     header.c_tot = V16PodU128::new(100);
     header.negative_pnl_account_count = V16PodU64::new(1);
+    header.bankruptcy_hlock_active = 1;
     account_header.capital = V16PodU128::new(100);
     account_header.pnl = V16PodI128::new(-40);
     account_header.residual_crystallized_loss_atoms_total = V16PodU128::new(7);
@@ -2732,6 +2759,7 @@ fn v16_principal_loss_crystallizes_residual_budget_monotonically() {
 
     assert_eq!(account.header.capital.get(), 60);
     assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(market.header.bankruptcy_hlock_active, 0);
     assert_eq!(
         account.header.residual_crystallized_loss_atoms_total.get(),
         47,

@@ -9952,6 +9952,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.set_account_pnl_inner(account, new_pnl, None)
     }
 
+    /// Keep the market-wide bankruptcy H-lock derived from the authoritative
+    /// negative-PnL account counter.  Individual account, stale-oracle and
+    /// recovery barriers are evaluated separately by the H-lock lane.
+    fn sync_bankruptcy_hlock_from_negative_pnl_count(&mut self) {
+        self.header.bankruptcy_hlock_active =
+            u8::from(self.header.negative_pnl_account_count.get() != 0);
+    }
+
     fn set_account_pnl_with_source(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -10112,6 +10120,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         account.header.pnl = V16PodI128::new(new_pnl);
         account.header.health_cert.valid = 0;
+        self.sync_bankruptcy_hlock_from_negative_pnl_count();
         Ok(())
     }
 
@@ -11854,6 +11863,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 )?)
             }
         };
+        // Reconcile markets initialized before bankruptcy_hlock_active became
+        // counter-derived.  This never bypasses unresolved negative PnL.
+        self.sync_bankruptcy_hlock_from_negative_pnl_count();
         Ok(AutoCrankResultV16 {
             selected: plan,
             outcome,
@@ -13656,7 +13668,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 .checked_add(cleared_i128)
                 .ok_or(V16Error::ArithmeticOverflow)?;
             self.set_account_pnl(account, new_pnl)?;
-            self.header.bankruptcy_hlock_active = 1;
         }
         self.reduce_position(account, request.asset_index, close_q)?;
         self.certify_account_after_local_settlement_with_price_override(account, None)?;
@@ -14153,6 +14164,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             );
         }
         account.header.pnl = V16PodI128::new(new_pnl);
+        self.sync_bankruptcy_hlock_from_negative_pnl_count();
         Ok(())
     }
 
