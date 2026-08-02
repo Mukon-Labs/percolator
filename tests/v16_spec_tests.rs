@@ -1714,6 +1714,33 @@ fn v16_view_rejects_overwithdraw() {
     assert_eq!(err, Err(V16Error::LockActive));
 }
 
+#[test]
+fn v16_withdraw_settles_flat_negative_pnl_before_exact_post_loss_exit() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 61);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
+        market.deposit_not_atomic(&mut account, 100).unwrap();
+    }
+    account_header.pnl = V16PodI128::new(-40);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+    header.bankruptcy_hlock_active = 1;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market.withdraw_not_atomic(&mut account, 60).unwrap();
+
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(account.header.capital.get(), 0);
+    assert_eq!(market.header.c_tot.get(), 0);
+    assert_eq!(market.header.vault.get(), 40);
+    assert_eq!(market.header.negative_pnl_account_count.get(), 0);
+    assert_eq!(market.header.bankruptcy_hlock_active, 0);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+}
+
 #[cfg(feature = "fuzz")]
 #[test]
 fn v16_insurance_lien_consume_rejects_fractional_bound_amount() {
