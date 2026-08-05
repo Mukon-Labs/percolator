@@ -763,6 +763,30 @@ impl V16Core {
         }
     }
 
+    /// Scale post-ADL price and funding accrual by each side's surviving
+    /// partition. A leg settles these indices through its entry-time
+    /// `a_basis`, so this preserves matched effective-OI conservation without
+    /// rewriting any portfolio basis.
+    #[inline]
+    pub(crate) fn kernel_adl_scaled_accrual_index_deltas(
+        price_delta: i128,
+        funding_index_delta: i128,
+        a_long: u128,
+        a_short: u128,
+    ) -> V16Result<(i128, i128, i128, i128)> {
+        let a_long = i128::try_from(a_long).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let a_short = i128::try_from(a_short).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let k_long = checked_i128_mul(price_delta, a_long)?;
+        let k_short = checked_i128_mul(price_delta, a_short)?
+            .checked_neg()
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let f_long = checked_i128_mul(funding_index_delta, a_long)?
+            .checked_neg()
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let f_short = checked_i128_mul(funding_index_delta, a_short)?;
+        Ok((k_long, k_short, f_long, f_short))
+    }
+
     #[inline]
     fn liquidation_progress_from_scores(before: RiskScoreV16, after: RiskScoreV16) -> bool {
         after.strictly_reduces_from(before)
@@ -1394,6 +1418,22 @@ impl V16Core {
             PositionRouteV16::Flip
         } else {
             PositionRouteV16::Resize
+        }
+    }
+
+    /// Once quantity ADL has reduced either side's A partition, only matched
+    /// risk reduction may continue. Attaching, flipping, or enlarging a leg
+    /// would issue fresh basis against an already-haircut partition.
+    #[inline]
+    pub(crate) fn kernel_position_route_requires_unit_adl(
+        route: PositionRouteV16,
+        current: i128,
+        new: i128,
+    ) -> bool {
+        match route {
+            PositionRouteV16::Attach | PositionRouteV16::Flip => true,
+            PositionRouteV16::Clear => false,
+            PositionRouteV16::Resize => new.unsigned_abs() > current.unsigned_abs(),
         }
     }
 
@@ -11431,24 +11471,28 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
 
         let price_delta = effective_price as i128 - old.effective_price as i128;
-        let k_delta = checked_i128_mul(price_delta, ADL_ONE as i128)?;
-        let funding_delta = if activity.funding_active {
+        let funding_index_delta = if activity.funding_active {
             let n = funding_rate_e9
                 .checked_mul(segment_dt as i128)
                 .and_then(|v| v.checked_mul(effective_price as i128))
                 .ok_or(V16Error::ArithmeticOverflow)?;
             floor_div_signed_conservative_i128(n, FUNDING_DEN)
-                .checked_mul(ADL_ONE as i128)
-                .ok_or(V16Error::ArithmeticOverflow)?
         } else {
             0
         };
+        let (k_delta_long, k_delta_short, funding_delta_long, funding_delta_short) =
+            V16Core::kernel_adl_scaled_accrual_index_deltas(
+                price_delta,
+                funding_index_delta,
+                old.a_long,
+                old.a_short,
+            )?;
 
         let mut asset = old;
-        asset.k_long = add_non_min_i128(asset.k_long, k_delta)?;
-        asset.k_short = add_non_min_i128(asset.k_short, -k_delta)?;
-        asset.f_long_num = add_non_min_i128(asset.f_long_num, -funding_delta)?;
-        asset.f_short_num = add_non_min_i128(asset.f_short_num, funding_delta)?;
+        asset.k_long = add_non_min_i128(asset.k_long, k_delta_long)?;
+        asset.k_short = add_non_min_i128(asset.k_short, k_delta_short)?;
+        asset.f_long_num = add_non_min_i128(asset.f_long_num, funding_delta_long)?;
+        asset.f_short_num = add_non_min_i128(asset.f_short_num, funding_delta_short)?;
         asset.effective_price = effective_price;
         asset.fund_px_last = effective_price;
         asset.slot_last = asset
@@ -11973,7 +12017,23 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Ok(());
         }
         let asset = self.asset_state(asset_index)?;
+        if asset.a_long != ADL_ONE || asset.a_short != ADL_ONE {
+            return Err(V16Error::LockActive);
+        }
         asset_risk_increase_gate(asset.lifecycle, asset.mode_long, asset.mode_short)
+    }
+
+    fn require_position_route_adl_safe(
+        &self,
+        asset_index: usize,
+        route: PositionRouteV16,
+        current: i128,
+        new: i128,
+    ) -> V16Result<()> {
+        if V16Core::kernel_position_route_requires_unit_adl(route, current, new) {
+            self.require_asset_risk_change_allowed(asset_index, true)?;
+        }
+        Ok(())
     }
 
     fn validate_configured_asset_index(&self, asset_index: usize) -> V16Result<()> {
@@ -12939,6 +12999,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // PRODUCTION KERNEL: classify the route (Attach/Clear/Flip/Resize) — the
         // exact decision this body dispatches on, factored out and contracted.
         let route = V16Core::kernel_classify_position_delta(current, new);
+        self.require_position_route_adl_safe(asset_index, route, current, new)?;
         if route == PositionRouteV16::Attach {
             let side = if new > 0 {
                 SideV16::Long
@@ -12987,7 +13048,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return self.clear_leg(account, asset_index);
         }
         if route == PositionRouteV16::Flip {
-            self.require_asset_risk_change_allowed(asset_index, true)?;
             self.clear_leg(account, asset_index)?;
             let side = if new > 0 {
                 SideV16::Long
@@ -12995,9 +13055,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 SideV16::Short
             };
             return self.attach_leg(account, asset_index, side, new);
-        }
-        if new.unsigned_abs() > current.unsigned_abs() {
-            self.require_asset_risk_change_allowed(asset_index, true)?;
         }
         let old_leg = account.header.legs[leg_slot].try_to_runtime()?;
         let new_weight = loss_weight_for_basis(new.unsigned_abs(), old_leg.a_basis)?;
@@ -13507,6 +13564,140 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             self.begin_full_drain_reset_inner(asset_index, opp)?;
         }
         Ok(())
+    }
+
+    /// Repair a legacy A-partition that admitted fresh basis after quantity
+    /// ADL. This is deliberately aggregate-only: portfolio basis, K/F history,
+    /// PnL, capital, and token-value ledgers are untouched.
+    ///
+    /// For a live side, `loss_weight_sum_side` is the aggregate unit-A basis.
+    /// Its canonical partition is therefore `OI_eff * ADL_ONE / weight`. A
+    /// legacy basis-reissue episode can only leave the stored A below that
+    /// value; any requested decrease is rejected as a different corruption.
+    /// A fully drained side is repaired by the ordinary epoch-reset path so
+    /// prior-epoch legs stop accruing while remaining individually settleable.
+    pub fn reconcile_legacy_adl_partition_not_atomic(
+        &mut self,
+        asset_index: usize,
+        side: SideV16,
+    ) -> V16Result<()> {
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        self.validate_configured_asset_index(asset_index)?;
+        self.require_asset_live_reducible(asset_index)?;
+        if self.has_pending_domain_loss_barrier(asset_index, side)? {
+            return Err(V16Error::LockActive);
+        }
+
+        let mut asset = self.asset_state(asset_index)?;
+        let (oi_eff, weight_sum, stored_count, pending_count, current_a, mode) = match side {
+            SideV16::Long => (
+                asset.oi_eff_long_q,
+                asset.loss_weight_sum_long,
+                asset.stored_pos_count_long,
+                asset.pending_obligation_count_long,
+                asset.a_long,
+                asset.mode_long,
+            ),
+            SideV16::Short => (
+                asset.oi_eff_short_q,
+                asset.loss_weight_sum_short,
+                asset.stored_pos_count_short,
+                asset.pending_obligation_count_short,
+                asset.a_short,
+                asset.mode_short,
+            ),
+        };
+        if mode != SideModeV16::Normal || pending_count != 0 {
+            return Err(V16Error::LockActive);
+        }
+
+        if oi_eff == 0 {
+            if stored_count == 0 || weight_sum == 0 {
+                return Err(V16Error::NonProgress);
+            }
+            return self.begin_full_drain_reset_inner(asset_index, side);
+        }
+        if stored_count == 0 || weight_sum == 0 || oi_eff > weight_sum {
+            return Err(V16Error::RecoveryRequired);
+        }
+
+        let canonical_a = wide_mul_div_floor_u128(oi_eff, ADL_ONE, weight_sum);
+        if canonical_a == 0 || canonical_a > ADL_ONE {
+            return Err(V16Error::RecoveryRequired);
+        }
+        if canonical_a == current_a {
+            return Err(V16Error::NonProgress);
+        }
+        if canonical_a < current_a {
+            return Err(V16Error::RecoveryRequired);
+        }
+        let next_risk_epoch = self
+            .header
+            .risk_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(V16Error::CounterOverflow)?;
+        match side {
+            SideV16::Long => asset.a_long = canonical_a,
+            SideV16::Short => asset.a_short = canonical_a,
+        }
+        self.set_asset_state(asset_index, asset)?;
+        self.header.risk_epoch = V16PodU64::new(next_risk_epoch);
+        Ok(())
+    }
+
+    /// Account-aware wrapper for the legacy migration. Nonzero-OI sides only
+    /// need aggregate A repair. A zero-OI side may be completed atomically when
+    /// the supplied account is its sole stored witness: settle the witness,
+    /// epoch-freeze the drained side, clear the prior-epoch leg without touching
+    /// OI, and finalize the reset.
+    pub fn reconcile_legacy_adl_partition_for_witness_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        side: SideV16,
+    ) -> V16Result<()> {
+        let leg = Self::active_leg_for_asset(&account.as_view(), asset_index)?;
+        if !leg.active || leg.side != side {
+            return Err(V16Error::InvalidLeg);
+        }
+        let asset = self.asset_state(asset_index)?;
+        let (oi_eff, weight_sum, stored_count) = match side {
+            SideV16::Long => (
+                asset.oi_eff_long_q,
+                asset.loss_weight_sum_long,
+                asset.stored_pos_count_long,
+            ),
+            SideV16::Short => (
+                asset.oi_eff_short_q,
+                asset.loss_weight_sum_short,
+                asset.stored_pos_count_short,
+            ),
+        };
+        if oi_eff != 0 {
+            return self.reconcile_legacy_adl_partition_not_atomic(asset_index, side);
+        }
+        if stored_count != 1 || weight_sum == 0 || leg.loss_weight != weight_sum {
+            return Err(V16Error::RecoveryRequired);
+        }
+
+        match self.settle_account_side_effects_not_atomic(
+            account,
+            self.header.config.public_b_chunk_atoms.get(),
+        )? {
+            PermissionlessProgressOutcomeV16::AccountCurrent => {}
+            PermissionlessProgressOutcomeV16::AccountBChunk(_) => return Err(V16Error::BStale),
+            _ => return Err(V16Error::RecoveryRequired),
+        }
+        self.reconcile_legacy_adl_partition_not_atomic(asset_index, side)?;
+        self.clear_leg(account, asset_index)?;
+        self.finalize_side_reset_not_atomic(asset_index, side)?;
+        self.settle_negative_pnl_from_principal_not_atomic(account)?;
+        self.certify_account_after_local_settlement_with_price_override(account, None)?;
+        self.validate_shape_audit_scan()?;
+        self.validate_account_audit_scan(&account.as_view())
     }
 
     fn reduce_position(

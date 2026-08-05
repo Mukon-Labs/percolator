@@ -1342,6 +1342,10 @@ If `W == 0`, residual clears only by reserved insurance or explicit protocol-own
 
 Quantity ADL applies exactly once after residual durability and is atomic with closing exposure clear/finalization or protected by a non-preemptible finalization barrier.
 
+After quantity ADL, each side's subsequent K and F index increments MUST be scaled by that side's current `A_side`; aggregate price and funding settlement across matched effective OI remains zero-sum. While either side has `A_side != ADL_ONE`, trades may reduce matched risk but MUST NOT attach, flip, or enlarge a leg. This prevents fresh basis from reissuing quantity already removed by ADL while preserving bilateral exit progress.
+
+A legacy side that admitted such basis may be reconciled only under explicit wrapper authority. For nonzero OI, the repair raises (never lowers) `A_side` to `floor(OI_eff_side * ADL_ONE / loss_weight_sum_side)`. For zero OI with one authority-witnessed stored leg, it settles that account, uses the ordinary full-drain epoch reset, clears the prior-epoch leg without subtracting OI, and finalizes the side. Live basis, K/F history, B, claims, and token-value ledgers MUST NOT be rewritten; ordinary witness settlement may materialize PnL and move its negative portion into that account's capital exactly as in the normal settlement path. Every repair MUST bump `risk_epoch`.
+
 `begin_full_drain_reset(asset, side)` requires zero OI, no close/pending barrier, no pending obligations, no liens, and side not already `ResetPending`.
 
 -------------------------------------------------------------------------------
