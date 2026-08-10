@@ -1,0 +1,106 @@
+name: Kani verification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      proof_layer:
+        description: Verification depth
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - plain
+          - closure
+          - contracts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kani-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  KANI_VERSION: 0.66.0
+
+jobs:
+  tests:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Run tests
+        run: cargo test --locked
+
+  smoke:
+    name: Kani smoke proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Verify the declared Kani version
+        run: |
+          grep -Fq '"kani-version": "0.66.0"' kani-list.json
+
+      - name: Install the pinned Kani toolchain
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+
+      - name: Prove signed floor division matches its reference
+        run: >-
+          cargo kani --tests --features fuzz --harness
+          proof_v16_floor_div_signed_conservative_matches_small_reference
+
+  full:
+    name: Kani ${{ inputs.proof_layer || 'plain' }} layer
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.proof_layer != 'smoke')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Verify the declared Kani version
+        run: |
+          grep -Fq '"kani-version": "0.66.0"' kani-list.json
+
+      - name: Install the pinned Kani toolchain
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+
+      - name: Run selected proof layer
+        env:
+          REQUESTED_LAYER: ${{ inputs.proof_layer }}
+        run: |
+          layer="${REQUESTED_LAYER:-plain}"
+          case "$layer" in
+            plain)
+              cargo kani --tests --features fuzz
+              ;;
+            closure)
+              cargo kani --tests --features fuzz,closure
+              ;;
+            contracts)
+              cargo kani --tests --features fuzz,contracts -Z function-contracts
+              ;;
+            *)
+              echo "Unsupported proof layer: $layer" >&2
+              exit 1
+              ;;
+          esac
