@@ -65,7 +65,7 @@ jobs:
           proof_v16_floor_div_signed_conservative_matches_small_reference
 
   full:
-    name: Kani ${{ inputs.proof_layer || 'plain' }} layer
+    name: Full Kani layer
     if: >-
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.proof_layer != 'smoke')
