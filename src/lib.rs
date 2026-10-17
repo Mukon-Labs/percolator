@@ -12,6 +12,8 @@ extern crate alloc;
 #[cfg(kani)]
 extern crate kani;
 
+pub mod martingaler;
+
 pub const POS_SCALE: u128 = 1_000_000;
 pub const ADL_ONE: u128 = 1_000_000_000_000_000;
 pub const MIN_A_SIDE: u128 = 100_000_000_000_000;
