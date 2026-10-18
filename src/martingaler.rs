@@ -12,9 +12,14 @@ use core::cmp::Ordering;
 pub use crate::wide_math::{mul_div_ceil_u256, wide_mul_div_floor_u128, U256};
 
 pub const RATE_SCALE_PPM: u128 = 1_000_000;
-pub const V1_MAX_LEVERAGE_X: u16 = 100;
+pub const V1_MAX_LEVERAGE_X: u16 = 500;
 pub const V1_QUOTE_DECIMALS: u8 = 6;
 pub const V1_QUOTE_ATOMS_PER_UNIT: u128 = 1_000_000;
+pub const V1_MIN_COLLATERAL_QUOTE_UNITS: u128 = 10;
+pub const V1_MIN_COLLATERAL_QUOTE: u128 = V1_MIN_COLLATERAL_QUOTE_UNITS * V1_QUOTE_ATOMS_PER_UNIT;
+pub const V1_PAYOUT_FACTOR_SCALE_BPS: u16 = 10_000;
+pub const V1_MIN_PAYOUT_FACTOR_BPS: u16 = 3_000;
+const LEGACY_FULL_RESERVE_ADMISSION: u16 = u16::MAX;
 pub const V1_MAX_POSITION_NOTIONAL_QUOTE_UNITS: u128 = 1_000_000;
 pub const V1_MAX_NET_PROFIT_PER_POSITION_QUOTE_UNITS: u128 = 100_000;
 pub const V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE_UNITS: u128 = 250_000;
@@ -150,6 +155,12 @@ pub struct Position {
     pub max_net_profit: u128,
     pub reserved_trader_profit: u128,
     pub funding: FundingKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PayoutQuote {
+    pub max_payable_profit: u128,
+    pub payout_factor_bps: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +354,9 @@ pub enum ModelError {
     QueueDebtGateExceeded,
     ControllerReservedProfitCapExceeded,
     TotalLiabilityGateExceeded,
+    PayoutFactorBelowFloor,
+    InvalidPayoutGuard,
+    PayoutGuardNotMet,
     UnknownClaim,
     ClaimOwnerMismatch,
     ClaimAmountExceeded,
@@ -630,11 +644,35 @@ impl Martingaler {
         notional: u128,
         leverage_x: u16,
     ) -> Result<(), ModelError> {
+        self.open_deposited_cash_position_guarded(
+            position_id,
+            controller_id,
+            market_id,
+            side,
+            protected_principal,
+            notional,
+            leverage_x,
+            LEGACY_FULL_RESERVE_ADMISSION,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_deposited_cash_position_guarded(
+        &mut self,
+        position_id: PositionId,
+        controller_id: ControllerId,
+        market_id: MarketId,
+        side: PositionSide,
+        protected_principal: u128,
+        notional: u128,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+    ) -> Result<(), ModelError> {
         if controller_id == 0 {
             return Err(ModelError::InvalidController);
         }
         self.transact(|next| {
-            let reserved_trader_profit = next.validate_open(
+            let payout = next.validate_open(
                 position_id,
                 controller_id,
                 market_id,
@@ -642,7 +680,9 @@ impl Martingaler {
                 protected_principal,
                 notional,
                 leverage_x,
+                min_payout_factor_bps,
             )?;
+            let reserved_trader_profit = payout.max_payable_profit;
             if next.record_count() >= next.config.max_records {
                 return Err(ModelError::RecordCapacityExceeded);
             }
@@ -809,8 +849,32 @@ impl Martingaler {
         notional: u128,
         leverage_x: u16,
     ) -> Result<(), ModelError> {
+        self.open_cash_position_guarded(
+            position_id,
+            controller_id,
+            market_id,
+            side,
+            protected_principal,
+            notional,
+            leverage_x,
+            LEGACY_FULL_RESERVE_ADMISSION,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_cash_position_guarded(
+        &mut self,
+        position_id: PositionId,
+        controller_id: ControllerId,
+        market_id: MarketId,
+        side: PositionSide,
+        protected_principal: u128,
+        notional: u128,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+    ) -> Result<(), ModelError> {
         self.transact(|next| {
-            let reserved_trader_profit = next.validate_open(
+            let payout = next.validate_open(
                 position_id,
                 controller_id,
                 market_id,
@@ -818,7 +882,9 @@ impl Martingaler {
                 protected_principal,
                 notional,
                 leverage_x,
+                min_payout_factor_bps,
             )?;
+            let reserved_trader_profit = payout.max_payable_profit;
             if next.record_count() >= next.config.max_records {
                 return Err(ModelError::RecordCapacityExceeded);
             }
@@ -869,8 +935,34 @@ impl Martingaler {
         notional: u128,
         leverage_x: u16,
     ) -> Result<OpenClaimOutcome, ModelError> {
+        self.open_claim_position_guarded(
+            position_id,
+            controller_id,
+            market_id,
+            side,
+            source_sequence,
+            claim_amount,
+            notional,
+            leverage_x,
+            LEGACY_FULL_RESERVE_ADMISSION,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_claim_position_guarded(
+        &mut self,
+        position_id: PositionId,
+        controller_id: ControllerId,
+        market_id: MarketId,
+        side: PositionSide,
+        source_sequence: ClaimSequence,
+        claim_amount: u128,
+        notional: u128,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+    ) -> Result<OpenClaimOutcome, ModelError> {
         self.transact(|next| {
-            let reserved_trader_profit = next.validate_open(
+            let payout = next.validate_open(
                 position_id,
                 controller_id,
                 market_id,
@@ -878,7 +970,9 @@ impl Martingaler {
                 claim_amount,
                 notional,
                 leverage_x,
+                min_payout_factor_bps,
             )?;
+            let reserved_trader_profit = payout.max_payable_profit;
             let claim_index = next
                 .claims
                 .iter()
@@ -1307,19 +1401,26 @@ impl Martingaler {
                 .get(&position.market_id)
                 .ok_or(InvariantError::UnknownPositionMarket)?;
             let collateral = position.funding.collateral();
-            let minimum_leverage =
-                position.notional / collateral + u128::from(position.notional % collateral != 0);
+            let exact_notional = collateral
+                .checked_mul(u128::from(position.leverage_x))
+                .ok_or(InvariantError::PositionRiskLimitExceeded)?;
             if position.leverage_x > market.config.max_leverage_x
-                || minimum_leverage > u128::from(position.leverage_x)
+                || position.notional != exact_notional
                 || position.notional > market.config.max_position_notional
                 || position.max_net_profit > market.config.max_net_profit_per_position
             {
                 return Err(InvariantError::PositionRiskLimitExceeded);
             }
-            let expected_reserve =
+            let nominal_profit =
                 core::cmp::min(position.notional, market.config.max_net_profit_per_position);
-            if expected_reserve != position.max_net_profit
-                || expected_reserve != position.reserved_trader_profit
+            let minimum_reserve = wide_mul_div_floor_u128(
+                nominal_profit,
+                u128::from(V1_MIN_PAYOUT_FACTOR_BPS),
+                u128::from(V1_PAYOUT_FACTOR_SCALE_BPS),
+            );
+            if position.max_net_profit != position.reserved_trader_profit
+                || position.reserved_trader_profit < minimum_reserve
+                || position.reserved_trader_profit > nominal_profit
             {
                 return Err(InvariantError::ReservedProfitMismatch);
             }
@@ -1552,11 +1653,17 @@ impl Martingaler {
         collateral: u128,
         notional: u128,
         leverage_x: u16,
-    ) -> Result<u128, ModelError> {
+        min_payout_factor_bps: u16,
+    ) -> Result<PayoutQuote, ModelError> {
         if position_id == 0 || self.used_position_ids.contains(&position_id) {
             return Err(ModelError::DuplicatePosition);
         }
         if collateral == 0 {
+            return Err(ModelError::ZeroPrincipal);
+        }
+        if min_payout_factor_bps != LEGACY_FULL_RESERVE_ADMISSION
+            && collateral < V1_MIN_COLLATERAL_QUOTE
+        {
             return Err(ModelError::ZeroPrincipal);
         }
         if notional == 0 {
@@ -1572,8 +1679,10 @@ impl Martingaler {
         if leverage_x == 0 || leverage_x > market.config.max_leverage_x {
             return Err(ModelError::InvalidLeverage);
         }
-        let minimum_leverage = notional / collateral + u128::from(notional % collateral != 0);
-        if minimum_leverage > u128::from(leverage_x) {
+        let exact_notional = collateral
+            .checked_mul(u128::from(leverage_x))
+            .ok_or(ModelError::ArithmeticOverflow)?;
+        if notional != exact_notional {
             return Err(ModelError::InvalidLeverage);
         }
         if notional > market.config.max_position_notional {
@@ -1596,23 +1705,90 @@ impl Martingaler {
         if self.total_queued > self.config.queue_debt_open_gate {
             return Err(ModelError::QueueDebtGateExceeded);
         }
-        let reserved_trader_profit =
-            core::cmp::min(notional, market.config.max_net_profit_per_position);
-        let controller_reserved_profit = self
-            .reserved_profit_for_controller(controller_id)?
-            .checked_add(reserved_trader_profit)
-            .ok_or(ModelError::ArithmeticOverflow)?;
-        if controller_reserved_profit > self.config.max_reserved_profit_per_controller {
-            return Err(ModelError::ControllerReservedProfitCapExceeded);
+        self.quote_payout_factor(controller_id, market_id, notional, min_payout_factor_bps)
+    }
+
+    pub fn quote_payout_factor(
+        &self,
+        controller_id: ControllerId,
+        market_id: MarketId,
+        notional: u128,
+        min_payout_factor_bps: u16,
+    ) -> Result<PayoutQuote, ModelError> {
+        if min_payout_factor_bps == LEGACY_FULL_RESERVE_ADMISSION {
+            let market = self
+                .markets
+                .get(&market_id)
+                .ok_or(ModelError::UnknownMarket)?;
+            let reserved = core::cmp::min(notional, market.config.max_net_profit_per_position);
+            let controller_reserved = self
+                .reserved_profit_for_controller(controller_id)?
+                .checked_add(reserved)
+                .ok_or(ModelError::ArithmeticOverflow)?;
+            if controller_reserved > self.config.max_reserved_profit_per_controller {
+                return Err(ModelError::ControllerReservedProfitCapExceeded);
+            }
+            let potential = self
+                .total_potential_liabilities()?
+                .checked_add(reserved)
+                .ok_or(ModelError::ArithmeticOverflow)?;
+            if potential > self.config.total_liability_open_gate {
+                return Err(ModelError::TotalLiabilityGateExceeded);
+            }
+            return Ok(PayoutQuote {
+                max_payable_profit: reserved,
+                payout_factor_bps: V1_PAYOUT_FACTOR_SCALE_BPS,
+            });
         }
-        let potential_liabilities = self
-            .total_potential_liabilities()?
-            .checked_add(reserved_trader_profit)
-            .ok_or(ModelError::ArithmeticOverflow)?;
-        if potential_liabilities > self.config.total_liability_open_gate {
-            return Err(ModelError::TotalLiabilityGateExceeded);
+        if min_payout_factor_bps != 0
+            && !(V1_MIN_PAYOUT_FACTOR_BPS..=V1_PAYOUT_FACTOR_SCALE_BPS)
+                .contains(&min_payout_factor_bps)
+        {
+            return Err(ModelError::InvalidPayoutGuard);
         }
-        Ok(reserved_trader_profit)
+        let market = self
+            .markets
+            .get(&market_id)
+            .ok_or(ModelError::UnknownMarket)?;
+        let nominal_profit = core::cmp::min(notional, market.config.max_net_profit_per_position);
+        if nominal_profit == 0 {
+            return Err(ModelError::ZeroNotional);
+        }
+        let controller_used = self.reserved_profit_for_controller(controller_id)?;
+        let controller_depth = self
+            .config
+            .max_reserved_profit_per_controller
+            .saturating_sub(controller_used);
+        let total_depth = self
+            .config
+            .total_liability_open_gate
+            .saturating_sub(self.total_potential_liabilities()?);
+        let available = core::cmp::min(
+            nominal_profit,
+            core::cmp::min(controller_depth, total_depth),
+        );
+        let factor = wide_mul_div_floor_u128(
+            available,
+            u128::from(V1_PAYOUT_FACTOR_SCALE_BPS),
+            nominal_profit,
+        );
+        let payout_factor_bps =
+            u16::try_from(factor).map_err(|_| ModelError::ArithmeticOverflow)?;
+        if payout_factor_bps < V1_MIN_PAYOUT_FACTOR_BPS {
+            return Err(ModelError::PayoutFactorBelowFloor);
+        }
+        if min_payout_factor_bps != 0 && payout_factor_bps < min_payout_factor_bps {
+            return Err(ModelError::PayoutGuardNotMet);
+        }
+        let max_payable_profit = wide_mul_div_floor_u128(
+            nominal_profit,
+            u128::from(payout_factor_bps),
+            u128::from(V1_PAYOUT_FACTOR_SCALE_BPS),
+        );
+        Ok(PayoutQuote {
+            max_payable_profit,
+            payout_factor_bps,
+        })
     }
 
     fn add_open_interest(

@@ -3,7 +3,8 @@ use percolator::martingaler::{
     MarketConfig, MarketMode, Martingaler, MartingalerConfig, ModelError, OracleCashPnl,
     PositionSide, SignedMagnitude, V1_MAX_NET_PROFIT_PER_POSITION_QUOTE,
     V1_MAX_POSITION_NOTIONAL_QUOTE, V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE,
-    V1_QUOTE_ATOMS_PER_UNIT, V1_QUOTE_DECIMALS, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
+    V1_MIN_COLLATERAL_QUOTE, V1_QUOTE_ATOMS_PER_UNIT, V1_QUOTE_DECIMALS,
+    V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
 };
 use proptest::prelude::*;
 
@@ -719,6 +720,80 @@ fn approved_display_caps_are_exact_six_decimal_quote_atom_values() {
 }
 
 #[test]
+fn v1_guarded_admission_enforces_ten_dollars_and_immutable_dynamic_factor() {
+    let mut model = model();
+    assert_eq!(
+        model.open_cash_position_guarded(
+            1,
+            10,
+            BTC,
+            PositionSide::Long,
+            V1_MIN_COLLATERAL_QUOTE - 1,
+            (V1_MIN_COLLATERAL_QUOTE - 1) * 100,
+            100,
+            0,
+        ),
+        Err(ModelError::ZeroPrincipal)
+    );
+
+    for id in 1..=2 {
+        model
+            .open_cash_position_guarded(
+                id,
+                10,
+                BTC,
+                PositionSide::Long,
+                1_000 * V1_QUOTE_ATOMS_PER_UNIT,
+                100_000 * V1_QUOTE_ATOMS_PER_UNIT,
+                100,
+                10_000,
+            )
+            .unwrap();
+    }
+    let quote = model
+        .quote_payout_factor(10, BTC, 100_000 * V1_QUOTE_ATOMS_PER_UNIT, 0)
+        .unwrap();
+    assert_eq!(quote.payout_factor_bps, 5_000);
+    assert_eq!(quote.max_payable_profit, 50_000 * V1_QUOTE_ATOMS_PER_UNIT);
+    let before_guard = model.clone();
+    assert_eq!(
+        model.open_cash_position_guarded(
+            3,
+            10,
+            BTC,
+            PositionSide::Short,
+            1_000 * V1_QUOTE_ATOMS_PER_UNIT,
+            100_000 * V1_QUOTE_ATOMS_PER_UNIT,
+            100,
+            6_000,
+        ),
+        Err(ModelError::PayoutGuardNotMet)
+    );
+    assert_eq!(model, before_guard);
+    model
+        .open_cash_position_guarded(
+            3,
+            10,
+            BTC,
+            PositionSide::Short,
+            1_000 * V1_QUOTE_ATOMS_PER_UNIT,
+            100_000 * V1_QUOTE_ATOMS_PER_UNIT,
+            100,
+            5_000,
+        )
+        .unwrap();
+    assert_eq!(
+        model.position(3).unwrap().max_net_profit,
+        50_000 * V1_QUOTE_ATOMS_PER_UNIT
+    );
+    assert_eq!(
+        model.quote_payout_factor(10, BTC, 100_000 * V1_QUOTE_ATOMS_PER_UNIT, 0),
+        Err(ModelError::PayoutFactorBelowFloor)
+    );
+    model.check_invariants().unwrap();
+}
+
+#[test]
 fn claim_funded_oversized_win_is_capped_and_settles_at_queue_tail() {
     let mut model = model();
     model
@@ -770,12 +845,13 @@ fn claim_funded_oversized_win_is_capped_and_settles_at_queue_tail() {
 }
 
 #[test]
-fn market_limits_are_independent_and_leverage_is_capped_at_100x() {
+fn market_limits_are_independent_and_leverage_is_capped_at_500x() {
     let mut cfg = config(64);
     cfg.markets[0].max_position_notional = 150;
     cfg.markets[0].max_net_profit_per_position = 150;
     cfg.markets[0].max_long_open_interest = 150;
     cfg.markets[0].max_short_open_interest = 120;
+    cfg.markets[1].max_leverage_x = 500;
     let mut model = Martingaler::new(cfg).unwrap();
     model
         .open_cash_position(1, 10, BTC, PositionSide::Long, 100, 100, 1)
@@ -810,11 +886,11 @@ fn market_limits_are_independent_and_leverage_is_capped_at_100x() {
     assert_eq!(model, before_short_overflow);
 
     model
-        .open_cash_position(7, 70, ETH, PositionSide::Short, 1, 100, 100)
+        .open_cash_position(7, 70, ETH, PositionSide::Short, 1, 500, 500)
         .unwrap();
     let before_leverage = model.clone();
     assert_eq!(
-        model.open_cash_position(8, 80, ETH, PositionSide::Short, 1, 101, 100),
+        model.open_cash_position(8, 80, ETH, PositionSide::Short, 1, 501, 501),
         Err(ModelError::InvalidLeverage)
     );
     assert_eq!(model, before_leverage);
@@ -1110,7 +1186,7 @@ fn invalid_configuration_and_arithmetic_rejections_are_atomic() {
     );
     invalid.max_records = 4;
     invalid.residual_bad_debt_cap = 1_000_000;
-    invalid.markets[0].max_leverage_x = 101;
+    invalid.markets[0].max_leverage_x = 501;
     assert_eq!(
         Martingaler::new(invalid),
         Err(ModelError::InvalidConfiguration)
@@ -1231,7 +1307,7 @@ fn deposited_cash_open_is_owner_isolated_and_atomic_on_failure() {
 
     let before = model.clone();
     assert_eq!(
-        model.open_deposited_cash_position(1, 10, BTC, PositionSide::Short, 101, 10_000, 100,),
+        model.open_deposited_cash_position(1, 10, BTC, PositionSide::Short, 101, 10_100, 100,),
         Err(ModelError::InsufficientCashCollateral)
     );
     assert_eq!(model, before);
